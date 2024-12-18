@@ -1,15 +1,20 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+import joblib
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 from sklearn.preprocessing import StandardScaler, LabelEncoder, MinMaxScaler
 from imblearn.over_sampling import ADASYN
 from xgboost import XGBClassifier
 from skopt import BayesSearchCV
 from skopt.space import Real, Integer
+from bayes_opt import BayesianOptimization
+from numbers import Real
+
 
 # Sidebar menu
-menu = st.sidebar.selectbox("Menu", ["Input Data", "Preprocessing", "Splitting Data", "Klasifikasi"])
+menu = st.sidebar.selectbox("Menu", ["Input Data", "Preprocessing", "Splitting Data", "Klasifikasi", "Prediksi"])
 
 data = None
 
@@ -76,7 +81,7 @@ elif menu == "Preprocessing":
             data_counts = data.iloc[:, -1].value_counts().sort_values(ascending=False)
             st.write("Distribusi kelas setelah balancing:")
             st.write(data_counts)
-        
+
         st.session_state.data = data
         
     else:
@@ -109,9 +114,6 @@ elif menu == "Splitting Data":
         st.dataframe(pd.concat([X_test, y_test], axis=1))
 
         st.session_state.split_data = (X_train, X_test, y_train, y_test)
-    
-        # st.session_state.data = data
-    
     else:
         st.warning("Please preprocess the data first.")
 
@@ -120,47 +122,108 @@ elif menu == "Klasifikasi":
 
     if "split_data" in st.session_state and st.session_state.split_data is not None:
         X_train, X_test, y_train, y_test = st.session_state.split_data
-        
-        # User Input Features
-        feature_names = list(X_train.columns)
-        user_input = {}
-        for feature_name in feature_names:
-            # Adjust input type based on data (e.g., st.number_input, st.selectbox)
-            user_input[feature_name] = st.number_input(feature_name)
-        
-        user_data = pd.DataFrame([user_input], columns=X_train.columns)
 
-        # st.write("Train and Test Data are ready.")
+        st.write("Train and Test Data are ready.")
 
-        def predict_accuracy(user_input, X_train, y_train, X_test, y_test):
-            user_data = pd.DataFrame([user_input], columns=X_train.columns)
-            param_grid = {
-                'learning_rate': Real(0.01, 1.0, prior='uniform'),    
-                'n_estimators': Integer(10, 5000),                          
-                'max_depth': Integer(70, 100),                               
-                'min_child_weight': Integer(10, 15),
-                'subsample': Real(0.5, 1.0, prior='uniform'),
-                'colsample_bytree': Real(0.7, 1.0, prior='uniform'),
-                'gamma': Real(0.05, 0.1, prior='uniform'),                      
-                'reg_alpha': Real(0.01, 100, prior='uniform'),
-                'reg_lambda': Real(0.01, 100, prior='uniform'),
+        # Define XGBoost and Bayesian Optimization
+        if st.button("Modeling"):
+
+            def xgb_evaluate(max_depth, learning_rate, n_estimators, subsample, colsample_bytree):
+                model = XGBClassifier(
+                    max_depth=int(max_depth),
+                    learning_rate=learning_rate,
+                    n_estimators=int(n_estimators),
+                    subsample=subsample,
+                    colsample_bytree=colsample_bytree,
+                    random_state=42,
+                    eval_metric='logloss'
+                )
+                scores = cross_val_score(model, X_train, y_train, scoring='accuracy', cv=5)
+                return scores.mean()
+            
+            param_bounds = {
+                'colsample_bytree': (0.7, 1.0),
+                'learning_rate': (0.01, 1.0),
+                'max_depth': (70, 100),
+                'n_estimators': (10, 5000),
+                'subsample': (0.5, 1.0),
             }
 
-            xgb = XGBClassifier(eval_metric='logloss')
-            opt = BayesSearchCV(xgb, param_grid, n_iter=50, cv=5, random_state=42)
-            opt.fit(X_train, y_train)
-            
-            y_pred = opt.predict(user_data)
-            accuracy = opt.score(X_test, y_test)
-            best_params = opt.best_params_
+            optimizer = BayesianOptimization(f=xgb_evaluate, pbounds=param_bounds, random_state=42)
+            optimizer.maximize(init_points=5, n_iter=10)
 
-            return y_pred[0], accuracy, best_params
-    
-        # Define XGBoost and Bayesian Optimization
-        if st.button("Prediksi"):
-            prediction, accuracy, best_params = predict_accuracy(user_input, X_train, y_train, X_test, y_test)
-            st.write("Prediksi:", prediction)
-            st.write("Akurasi Model:", accuracy)
-            st.write("Parameter Terbaik:", best_params)
+            st.write("Best Parameters Found:")
+            best_params = optimizer.max['params']
+            best_params['colsample_bytree'] = best_params['colsample_bytree']
+            best_params['learning_rate'] = best_params['learning_rate']
+            best_params['max_depth'] = int(best_params['max_depth'])
+            best_params['n_estimators'] = int(best_params['n_estimators'])
+            best_params['subsample'] = best_params['subsample']
+            st.json(best_params)
+
+            # 6. Training Model
+            st.subheader("Training XGBoost Model")
+            final_model = XGBClassifier(
+                max_depth=best_params['max_depth'],
+                learning_rate=best_params['learning_rate'],
+                n_estimators=best_params['n_estimators'],
+                subsample=best_params['subsample'],
+                colsample_bytree=best_params['colsample_bytree'],
+                random_state=42,
+                eval_metric='logloss'
+            )
+            final_model.fit(X_train, y_train)
+            
+            # Simpan model ke file
+            joblib.dump(final_model, 'xgboost_model.pkl')
+            st.success("Model telah disimpan sebagai 'xgboost_model.pkl'.")
+
+            # 7. Evaluasi Model
+            st.subheader("Evaluasi Model")
+            y_pred = final_model.predict(X_test)
+            accuracy = accuracy_score(y_test, y_pred)
+            conf_matrix = confusion_matrix(y_test, y_pred)
+            classification = classification_report(y_test, y_pred)
+
+            st.write(f"**Accuracy:** {accuracy:.4f}")
+            
+            # Confusion Matrix
+            st.write("Confusion Matrix:")
+            st.text(conf_matrix)
+            
+            # Classification Report
+            st.write("Classification Report:")
+            st.text(classification)
     else:
         st.warning("Please split the data first.")
+
+elif menu == "Prediksi":
+    st.header("Prediksi Menggunakan Model yang Telah Disimpan")
+
+    # Muat model
+    try:
+        model = joblib.load('xgboost_model.pkl')
+        st.success("Model berhasil dimuat.")
+    except FileNotFoundError:
+        st.error("Model belum tersedia. Harap lakukan klasifikasi terlebih dahulu.")
+        st.stop()
+
+    # Input fitur untuk prediksi
+    st.subheader("Masukkan Nilai Fitur:")
+    gender = st.selectbox("Gender (0: Female, 1: Male)", [0, 1])
+    age = st.number_input("Age:", min_value=0, max_value=120)
+    HbA1c_level = st.number_input("HbA1c Level:", min_value=0.0, max_value=10.0)
+    blood_glucose_level = st.number_input("Blood Glucose Level:", min_value=0.0, max_value=500.0)
+
+    # Tombol untuk prediksi
+    if st.button("Prediksi"):
+        input_data = pd.DataFrame({
+            'gender': [gender],
+            'age': [age],
+            'HbA1c_level': [HbA1c_level],
+            'blood_glucose_level': [blood_glucose_level]
+        })
+
+        # Prediksi
+        prediction = model.predict(input_data)[0]
+        st.write(f"**Hasil Prediksi:** {'Diabetes' if prediction == 1 else 'Tidak Diabetes'}")
